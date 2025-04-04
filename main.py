@@ -193,22 +193,60 @@ class SharedImageBuffer(object):
     def containsImageBufferForDeviceUrl(self, deviceUrl):
         return self.imageBufferDict.__contains__(deviceUrl)
 
+
+class ProcessingThread(QThread):
+    def __init__(self, device_id, shared_buffer_manager, write_buffer, sleep_time_ms):
+        super().__init__()
+        self.shared_buffer_manager = shared_buffer_manager
+        self.sleep_time = sleep_time_ms
+        self.write_buffer = write_buffer
+        self.device_id = device_id
+        self.is_running = False
+        self.mutex = QMutex()
+        self.shared_buffer_access_mutex = QMutex()
+        self.write_buffer_mutex = QMutex()
+
+
+    def stop_thread(self):
+        with QMutexLocker(self.mutex):
+            self.is_running = False
+
+    def run(self):
+        # when
+        self.is_running = True
+        while self.is_running:
+            self.write_buffer.sync(self.device_id)
+            self.shared_buffer_access_mutex.lock()
+            raw_data = self.shared_buffer_manager.getByDeviceUrl(self.device_id).get()
+            raw_frame = raw_data.copy()
+            self.shared_buffer_access_mutex.unlock()
+
+            self.msleep(self.sleep_time)  
+            self.write_buffer_mutex.lock()
+            # do sync or not?
+            self.write_buffer.getByDeviceUrl(self.device_id).add(raw_frame, True)
+            self.write_buffer_mutex.unlock()
+            print("read and then writing to new buffer!")
+
+
 class RecorderThread(QThread):
+
+
     '''when it is run it must write to disk from buffers'''
     signal_writing_notifier = pyqtSignal()
 
-    def __init__(self, shared_buffer_manager):
+    def __init__(self, shared_buffer_manager, device_id, width, height, filename):
         super().__init__()
+        self.device_id = device_id
         self.shared_buffer_manager = shared_buffer_manager
 
         self.is_running = False
         self.mutex = QMutex()
         self.fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         self.fps = 30.0
-        self.width, self.height = (
-            640,
-            480,
-            )
+        self.width = width
+        self.height = height
+        self.filename = filename
         self.shared_buffer_access_mutex = QMutex()
 
     def stop_thread(self):
@@ -218,42 +256,33 @@ class RecorderThread(QThread):
     def run(self):
         # when
         self.is_running = True
-        self.writer_of_camera = cv2.VideoWriter(
-            'test_filename.mp4',
+        self.writer = cv2.VideoWriter(
+            self.filename,
             self.fourcc,
             self.fps,
             (self.width, self.height)
         )
-
-        self.writer_of_screen = cv2.VideoWriter(
-            'test_filename_screen.mp4',
-            self.fourcc,
-            self.fps,
-            (1920, 1080)
-        )
         while self.is_running: # for now
             # stop or not stop mutex or isinterruptrequested
             self.shared_buffer_access_mutex.lock()
-            raw_data = self.shared_buffer_manager.getByDeviceUrl("camera").get()
+            raw_data = self.shared_buffer_manager.getByDeviceUrl(self.device_id).get()
             raw_frame = raw_data.copy()
             # if no images from sharedbuffer or stopped: break
             # or maybe just stop and break
+            # self.msleep(16)  #on putpose waiting
 
-            self.writer_of_camera.write(raw_frame)
+            self.writer.write(raw_frame)
 
-            screen_raw_frame = self.shared_buffer_manager.getByDeviceUrl("screen").get()
-            self.writer_of_screen.write(screen_raw_frame)
+            # screen_raw_frame = self.shared_buffer_manager.getByDeviceUrl("screen").get()
+            # self.writer_of_screen.write(screen_raw_frame)
             print("writing to writer")
             self.shared_buffer_access_mutex.unlock()
 
             self.signal_writing_notifier.emit()
             # write a frame to
         
-        self.writer_of_camera.release()
-        self.writer_of_screen.release()
-
-
-
+        self.writer.release()
+        # self.writer_of_screen.release()
 
 class ScreenCaptureThread(QThread):
     screen_frame_signal = pyqtSignal(np.ndarray)
@@ -435,6 +464,9 @@ class MainWindow(QWidget):
         # shared buffer
 
         self.shared_buffer = SharedImageBuffer()
+        self.final_buffer = SharedImageBuffer()
+        self.final_buffer.setSyncEnabled(True)
+
         self.shared_buffer.setSyncEnabled(True)
         screen_device_id = "screen"
         camera_device_id = "camera"
@@ -442,6 +474,10 @@ class MainWindow(QWidget):
         self.shared_buffer.add(camera_device_id, Buffer(10), True)
         self.shared_buffer.add("screen1", Buffer(10), True)
         self.shared_buffer.add("screen2", Buffer(10), True)
+
+        # lets say we make new shared buffer:
+        self.final_buffer.add(screen_device_id, Buffer(10), True)
+        self.final_buffer.add(camera_device_id, Buffer(10), True)
 
         # Layout setup
         self.layout = QVBoxLayout(self)
@@ -494,8 +530,13 @@ class MainWindow(QWidget):
         self.screen_thread2 = ScreenCaptureThread(2, self.screen_view, self.shared_buffer, screen_device_id + "2")
         self.camera_thread = CameraCaptureThread(self.camera_view, self.shared_buffer, camera_device_id)
 
-        self.recording_thread = RecorderThread(self.shared_buffer)
-        self.recording_thread.signal_writing_notifier.connect(self.display_recording)
+        self.recording_thread1 = RecorderThread(self.final_buffer, camera_device_id, 640, 480, "camera_test_record_fast.mp4")
+        self.recording_thread2 = RecorderThread(self.final_buffer, screen_device_id, 1920, 1080, "screen_test_record_fast.mp4")
+
+
+        self.processing_thread1 = ProcessingThread(camera_device_id, self.shared_buffer, self.final_buffer, sleep_time_ms=0)
+        self.processing_thread2 = ProcessingThread(screen_device_id, self.shared_buffer, self.final_buffer, sleep_time_ms=0)
+        self.recording_thread1.signal_writing_notifier.connect(self.display_recording)
 
         self.is_recording = False
         self.is_paused = False
@@ -549,14 +590,21 @@ class MainWindow(QWidget):
         self.is_recording = True
         self.is_paused = False
         self.signal_start_rec.emit()
-        self.recording_thread.start()
+        self.processing_thread1.start()
+        self.processing_thread2.start()
+        self.recording_thread1.start()
+        self.recording_thread2.start()
+
         self.update_view_state()
 
     def stop_recording(self):
         self.is_recording = False
         self.is_paused = False
         self.signal_stop_rec.emit()
-        self.recording_thread.stop_thread()
+        self.processing_thread1.stop_thread()
+        self.processing_thread2.stop_thread()
+        self.recording_thread1.stop_thread()
+        self.recording_thread2.stop_thread()
         self.update_view_state()
 
     def pause_recording(self):
